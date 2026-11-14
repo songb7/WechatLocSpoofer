@@ -1,10 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
     package="com.example.wechatlocspoofer">
 
-    <!-- 悬浮窗权限：用于在微信实时位置共享界面上方显示全向移动摇杆 -->
+    <!-- 免 Root 模拟位置核心权限 -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission
+        android:name="android.permission.ACCESS_MOCK_LOCATION"
+        tools:ignore="MockLocation,ProtectedPermissions" />
+
+    <!-- 悬浮窗摇杆与后台保活权限 -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-    <!-- 前台服务权限：保持悬浮窗摇杆与坐标热更新服务在后台存活 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
     <application
@@ -13,22 +20,6 @@
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
 
-        <!-- 声明为 Xposed / LSPosed 模块 -->
-        <meta-data
-            android:name="xposedmodule"
-            android:value="true" />
-        <meta-data
-            android:name="xposeddescription"
-            android:value="微信实时位置共享虚拟定位与无线信号防回跳模块（支持悬浮摇杆与海外预设）" />
-        <meta-data
-            android:name="xposedminversion"
-            android:value="82" />
-        <!-- 声明默认推荐的 LSPosed 作用域 -->
-        <meta-data
-            android:name="xposedscope"
-            android:resource="@array/xposed_scope" />
-
-        <!-- 主控界面：坐标切换、预设景点选择、参数配置与悬浮窗启动 -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -38,7 +29,6 @@
             </intent-filter>
         </activity>
 
-        <!-- 悬浮窗摇杆服务：在微信上方实时微调经纬度与行走航向角 -->
         <service
             android:name=".JoystickOverlayService"
             android:enabled="true"

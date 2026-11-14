@@ -1,21 +1,30 @@
 package com.example.wechatlocspoofer
 
+import android.Manifest
 import android.app.Activity
+import android.app.AppOpsManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.location.Criteria
+import android.location.Location
+import android.location.LocationManager
+import android.location.provider.ProviderProperties
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.Process
+import android.os.SystemClock
 import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
@@ -32,16 +41,11 @@ import android.widget.Spinner
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
-import org.json.JSONObject
-import java.io.File
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.hypot
-import kotlin.math.sin
+import kotlin.random.Random
 
-/**
- * 预设海外热门旅游坐标数据结构 (WGS-84 国际标准坐标)
- */
 data class PresetSpot(
     val name: String,
     val lat: Double,
@@ -50,93 +54,128 @@ data class PresetSpot(
 )
 
 /**
- * 跨进程配置写入器：
- * 借鉴 LocationSpoofer (https://github.com/boonlove/LocationSpoofer) 的 IPC 架构，
- * 通过 Root 权限将配置写入 /data/local/tmp/wechat_spoof_config.json 并赋予 644 全局可读与 shell_data_file 上下文，
- * 使微信进程内的 Hook 守护线程可以零延迟读取，规避 Android 11+ 包可见性限制。
+ * 免 Root 模拟位置核心引擎：
+ * 直接接管 Android 系统原生 LocationManager 的 gps / network / fused 通道，
+ * 每 500ms 持续向系统注入带 O-U 自然微抖动的 WGS-84 国外坐标，无需 Root 即可让正版微信直接读取。
  */
-object RootConfigBridge {
-    const val CONFIG_PATH = "/data/local/tmp/wechat_spoof_config.json"
+object MockLocationEngine {
+    @Volatile var isMocking = false
+    @Volatile var latitude = 35.658581
+    @Volatile var longitude = 139.745433
+    @Volatile var altitude = 42.5
+    @Volatile var speed = 0.0f
+    @Volatile var bearing = 0.0f
+    @Volatile var enableJitter = true
 
-    @Volatile var enabled: Boolean = true
-    @Volatile var latitude: Double = 35.658581
-    @Volatile var longitude: Double = 139.745433
-    @Volatile var altitude: Double = 42.5
-    @Volatile var accuracy: Float = 6.5f
-    @Volatile var speed: Float = 0.0f
-    @Volatile var bearing: Float = 0.0f
-    @Volatile var enableJitter: Boolean = true
-    @Volatile var lockRawSignal: Boolean = true
-    @Volatile var autoConvertGcj02: Boolean = false
+    private var driftNorth = 0.0
+    private var driftEast = 0.0
+    private val handler = Handler(Looper.getMainLooper())
+    private val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, "fused")
 
-    fun loadFromLocalOrTmp(context: Context) {
-        try {
-            val file = File(CONFIG_PATH)
-            if (file.exists() && file.canRead()) {
-                val json = JSONObject(file.readText())
-                enabled = json.optBoolean("enabled", true)
-                latitude = json.optDouble("latitude", 35.658581)
-                longitude = json.optDouble("longitude", 139.745433)
-                altitude = json.optDouble("altitude", 42.5)
-                accuracy = json.optDouble("accuracy", 6.5).toFloat()
-                speed = json.optDouble("speed", 0.0).toFloat()
-                bearing = json.optDouble("bearing", 0.0).toFloat()
-                enableJitter = json.optBoolean("enableJitter", true)
-                lockRawSignal = json.optBoolean("lockRawSignal", true)
-                autoConvertGcj02 = json.optBoolean("autoConvertGcj02", false)
-            }
-        } catch (_: Throwable) {
+    private val tickRunnable = object : Runnable {
+        override fun run() {
+            if (!isMocking) return
+            pushMockLocations()
+            handler.postDelayed(this, 500)
         }
     }
 
-    fun pushToTmpAsync(onResult: ((Boolean) -> Unit)? = null) {
-        val payload = JSONObject().apply {
-            put("enabled", enabled)
-            put("latitude", latitude)
-            put("longitude", longitude)
-            put("altitude", altitude)
-            put("accuracy", accuracy.toDouble())
-            put("speed", speed.toDouble())
-            put("bearing", bearing.toDouble())
-            put("enableJitter", enableJitter)
-            put("lockRawSignal", lockRawSignal)
-            put("autoConvertGcj02", autoConvertGcj02)
-        }.toString()
+    private var appContext: Context? = null
 
-        Thread {
-            val ok = try {
-                val proc = Runtime.getRuntime().exec("su")
-                proc.outputStream.bufferedWriter().use { writer ->
-                    writer.write("cat << 'EOF' > $CONFIG_PATH\n$payload\nEOF\n")
-                    writer.write("chmod 644 $CONFIG_PATH\n")
-                    writer.write("chcon u:object_r:shell_data_file:s0 $CONFIG_PATH 2>/dev/null || true\n")
-                    writer.write("exit\n")
-                    writer.flush()
-                }
-                proc.waitFor() == 0
-            } catch (_: Throwable) {
-                false
-            }
-            if (onResult != null) {
-                Handler(Looper.getMainLooper()).post { onResult(ok) }
-            }
-        }.start()
+    fun checkMockPermission(context: Context): Boolean {
+        return try {
+            val ops = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+            ops.checkOpNoThrow(AppOpsManager.OPSTR_MOCK_LOCATION, Process.myUid(), context.packageName) == AppOpsManager.MODE_ALLOWED
+        } catch (_: Throwable) {
+            false
+        }
     }
 
-    fun forceStopWeChat() {
-        Thread {
+    fun start(context: Context): Boolean {
+        appContext = context.applicationContext
+        if (!checkMockPermission(context)) return false
+        val lm = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+
+        for (p in providers) {
             try {
-                Runtime.getRuntime().exec(arrayOf("su", "-c", "am force-stop com.tencent.mm")).waitFor()
+                try { lm.removeTestProvider(p) } catch (_: Throwable) {}
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    val props = ProviderProperties.Builder()
+                        .setHasAltitudeSupport(true)
+                        .setHasSpeedSupport(true)
+                        .setHasBearingSupport(true)
+                        .setPowerUsage(ProviderProperties.POWER_USAGE_LOW)
+                        .setAccuracy(ProviderProperties.ACCURACY_FINE)
+                        .build()
+                    lm.addTestProvider(p, props)
+                } else {
+                    @Suppress("DEPRECATION")
+                    lm.addTestProvider(p, false, true, false, false, true, true, true, Criteria.POWER_LOW, Criteria.ACCURACY_FINE)
+                }
+                lm.setTestProviderEnabled(p, true)
             } catch (_: Throwable) {
             }
-        }.start()
+        }
+
+        isMocking = true
+        handler.removeCallbacks(tickRunnable)
+        handler.post(tickRunnable)
+        return true
+    }
+
+    fun stop(context: Context) {
+        isMocking = false
+        handler.removeCallbacks(tickRunnable)
+        val lm = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        for (p in providers) {
+            try {
+                lm.setTestProviderEnabled(p, false)
+                lm.removeTestProvider(p)
+            } catch (_: Throwable) {}
+        }
+    }
+
+    private fun pushMockLocations() {
+        val ctx = appContext ?: return
+        val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+
+        // O-U 自然微抖动（控制在 2.5 米以内，让微信实时位置共享自然逼真）
+        if (enableJitter && speed == 0f) {
+            driftNorth = (driftNorth * 0.92 + Random.nextDouble(-0.25, 0.25)).coerceIn(-2.5, 2.5)
+            driftEast = (driftEast * 0.92 + Random.nextDouble(-0.25, 0.25)).coerceIn(-2.5, 2.5)
+        } else {
+            driftNorth = 0.0
+            driftEast = 0.0
+        }
+
+        val effLat = latitude + (driftNorth / 111320.0)
+        val effLon = longitude + (driftEast / (111320.0 * cos(Math.toRadians(latitude)).coerceAtLeast(0.0001)))
+
+        for (p in providers) {
+            try {
+                val loc = Location(p).apply {
+                    latitude = effLat
+                    longitude = effLon
+                    altitude = this@MockLocationEngine.altitude + Random.nextDouble(-0.3, 0.3)
+                    accuracy = 5.5f + Random.nextFloat() * 1.2f
+                    speed = this@MockLocationEngine.speed
+                    bearing = this@MockLocationEngine.bearing
+                    time = System.currentTimeMillis()
+                    elapsedRealtimeNanos = SystemClock.elapsedRealtimeNanos()
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        verticalAccuracyMeters = 3.5f
+                        speedAccuracyMetersPerSecond = 0.2f
+                        bearingAccuracyDegrees = 5.0f
+                    }
+                    extras = Bundle().apply { putInt("satellites", 15) }
+                }
+                lm.setTestProviderLocation(p, loc)
+            } catch (_: Throwable) {
+            }
+        }
     }
 }
 
-/**
- * 主控 Activity：纯代码构建 UI，无需额外创建 res/layout XML 文件，直接放入工程即可编译。
- * 支持海外热门景点一键切换、剪贴板/手输坐标、防回跳开关、以及开启悬浮窗摇杆。
- */
 class MainActivity : Activity() {
 
     private lateinit var latInput: EditText
@@ -158,27 +197,28 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        RootConfigBridge.loadFromLocalOrTmp(this)
 
-        val rootScroll = ScrollView(this).apply {
-            setBackgroundColor(Color.parseColor("#F5F7FA"))
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION), 100)
+            }
         }
 
+        val rootScroll = ScrollView(this).apply { setBackgroundColor(Color.parseColor("#F5F7FA")) }
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             val pad = dp(18)
             setPadding(pad, dp(24), pad, pad)
         }
 
-        // 顶部标题与状态横幅
         val titleView = TextView(this).apply {
-            text = "WeChat 虚拟定位控制台"
+            text = "WeChat 免 Root 虚拟定位"
             textSize = 22f
             setTypeface(typeface, Typeface.BOLD)
             setTextColor(Color.parseColor("#111827"))
         }
         val subtitleView = TextView(this).apply {
-            text = "LSPosed 双通道劫持 · 切断国内 Wi-Fi/基站 · O-U 物理微抖动"
+            text = "免 Root 系统级三通道注入 · 悬浮摇杆实时行走 · 零封号风险"
             textSize = 13f
             setTextColor(Color.parseColor("#6B7280"))
             setPadding(0, dp(4), 0, dp(14))
@@ -187,19 +227,17 @@ class MainActivity : Activity() {
         container.addView(subtitleView)
 
         statusBanner = TextView(this).apply {
-            text = "状态：等待同步配置至 /data/local/tmp..."
+            text = "状态：请先点下方第 1 个按钮，在【开发者选项 -> 选择模拟位置信息应用】中选中本软件"
             textSize = 13f
-            setTextColor(Color.parseColor("#065F46"))
-            background = roundedBg("#D1FAE5", 10)
+            setTextColor(Color.parseColor("#92400E"))
+            background = roundedBg("#FEF3C7", 10)
             setPadding(dp(12), dp(10), dp(12), dp(10))
         }
         container.addView(statusBanner)
 
-        // 卡片 1：预设国外旅游目的地一键选点
-        val presetCard = buildCardLayout("🌍 海外热门景点快速切换 (WGS-84)")
+        val presetCard = buildCardLayout("🌍 海外热门景点一键切换 (WGS-84)")
         val spinner = Spinner(this)
-        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, presets.map { it.name })
-        spinner.adapter = adapter
+        spinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, presets.map { it.name })
         spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
                 val spot = presets[position]
@@ -212,116 +250,109 @@ class MainActivity : Activity() {
         presetCard.addView(spinner)
         container.addView(presetCard, cardLayoutParams())
 
-        // 卡片 2：经纬度与海拔精确输入
         val coordCard = buildCardLayout("📍 经纬度与海拔参数")
-        latInput = buildLabeledInput(coordCard, "纬度 (Latitude, WGS-84):", RootConfigBridge.latitude.toString())
-        lonInput = buildLabeledInput(coordCard, "经度 (Longitude, WGS-84):", RootConfigBridge.longitude.toString())
-        altInput = buildLabeledInput(coordCard, "海拔高度 (米):", RootConfigBridge.altitude.toString())
+        latInput = buildLabeledInput(coordCard, "纬度 (Latitude, WGS-84):", MockLocationEngine.latitude.toString())
+        lonInput = buildLabeledInput(coordCard, "经度 (Longitude, WGS-84):", MockLocationEngine.longitude.toString())
+        altInput = buildLabeledInput(coordCard, "海拔高度 (米):", MockLocationEngine.altitude.toString())
+
+        val jitterSwitch = Switch(this).apply {
+            text = "开启自然 GPS 微抖动（实时共享更逼真）"
+            isChecked = MockLocationEngine.enableJitter
+            setPadding(0, dp(10), 0, dp(4))
+            setOnCheckedChangeListener { _, isChecked -> MockLocationEngine.enableJitter = isChecked }
+        }
+        coordCard.addView(jitterSwitch)
         container.addView(coordCard, cardLayoutParams())
 
-        // 卡片 3：防检测与信号屏蔽开关
-        val switchCard = buildCardLayout("🛡️ 微信实时共享防穿帮设置")
-        val enableSwitch = Switch(this).apply {
-            text = "启用虚拟定位总开关"
-            isChecked = RootConfigBridge.enabled
-            setPadding(0, dp(6), 0, dp(6))
-            setOnCheckedChangeListener { _, isChecked -> RootConfigBridge.enabled = isChecked }
+        val btnDevSettings = Button(this).apply {
+            text = "⚙️ 1. 打开【开发者选项】选定本应用为模拟位置应用"
+            setTextColor(Color.parseColor("#1E40AF"))
+            background = roundedBg("#DBEAFE", 10)
+            setOnClickListener {
+                try {
+                    startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
+                } catch (_: Throwable) {
+                    startActivity(Intent(Settings.ACTION_SETTINGS))
+                }
+            }
         }
-        val lockSignalSwitch = Switch(this).apply {
-            text = "锁定定位源（拦截国内 Wi-Fi 扫描与 460 基站，防回跳）"
-            isChecked = RootConfigBridge.lockRawSignal
-            setPadding(0, dp(6), 0, dp(6))
-            setOnCheckedChangeListener { _, isChecked -> RootConfigBridge.lockRawSignal = isChecked }
-        }
-        val jitterSwitch = Switch(this).apply {
-            text = "开启 O-U 自然微抖动（实时共享时模拟真实 GPS 呼吸波动）"
-            isChecked = RootConfigBridge.enableJitter
-            setPadding(0, dp(6), 0, dp(6))
-            setOnCheckedChangeListener { _, isChecked -> RootConfigBridge.enableJitter = isChecked }
-        }
-        val gcjSwitch = Switch(this).apply {
-            text = "国内坐标自动转 GCJ-02（定位在国外请保持关闭）"
-            isChecked = RootConfigBridge.autoConvertGcj02
-            setPadding(0, dp(6), 0, dp(6))
-            setOnCheckedChangeListener { _, isChecked -> RootConfigBridge.autoConvertGcj02 = isChecked }
-        }
-        switchCard.addView(enableSwitch)
-        switchCard.addView(lockSignalSwitch)
-        switchCard.addView(jitterSwitch)
-        switchCard.addView(gcjSwitch)
-        container.addView(switchCard, cardLayoutParams())
+        container.addView(btnDevSettings, cardLayoutParams())
 
-        // 操作按钮组
-        val btnSave = Button(this).apply {
-            text = "⚡ 保存并热更新坐标（1秒内生效）"
+        val btnStart = Button(this).apply {
+            text = "⚡ 2. 启动 / 更新 免 Root 虚拟定位"
             setTextColor(Color.WHITE)
             background = roundedBg("#2563EB", 10)
-            setOnClickListener { applyAndSyncCoordinates() }
+            setOnClickListener { startOrUpdateMocking() }
         }
-        container.addView(btnSave, cardLayoutParams())
+        container.addView(btnStart, cardLayoutParams())
 
         val btnJoystick = Button(this).apply {
-            text = "🕹️ 开启/关闭 悬浮窗全向移动摇杆"
+            text = "🕹️ 3. 开启 / 关闭 悬浮窗全向移动摇杆"
             setTextColor(Color.WHITE)
             background = roundedBg("#059669", 10)
             setOnClickListener { toggleFloatingJoystick() }
         }
         container.addView(btnJoystick, cardLayoutParams())
 
-        val btnRestartWeChat = Button(this).apply {
-            text = "🔄 强行停止微信（首次勾选作用域后点击）"
+        val btnStop = Button(this).apply {
+            text = "⏹️ 停止模拟位置并恢复真实定位"
             setTextColor(Color.parseColor("#B91C1C"))
             background = roundedBg("#FEE2E2", 10)
             setOnClickListener {
-                RootConfigBridge.forceStopWeChat()
-                Toast.makeText(this@MainActivity, "已发送强行停止微信指令", Toast.LENGTH_SHORT).show()
+                MockLocationEngine.stop(this@MainActivity)
+                stopService(Intent(this@MainActivity, JoystickOverlayService::class.java))
+                statusBanner.text = "已停止模拟位置，手机已恢复真实 GPS"
+                statusBanner.setTextColor(Color.parseColor("#374151"))
+                statusBanner.background = roundedBg("#E5E7EB", 10)
             }
         }
-        container.addView(btnRestartWeChat, cardLayoutParams())
+        container.addView(btnStop, cardLayoutParams())
 
         rootScroll.addView(container)
         setContentView(rootScroll)
     }
 
-    private fun applyAndSyncCoordinates() {
+    private fun startOrUpdateMocking(): Boolean {
         val lat = latInput.text.toString().toDoubleOrNull()
         val lon = lonInput.text.toString().toDoubleOrNull()
         val alt = altInput.text.toString().toDoubleOrNull() ?: 35.0
         if (lat == null || lon == null || lat !in -90.0..90.0 || lon !in -180.0..180.0) {
-            Toast.makeText(this, "请输入合法的经纬度范围", Toast.LENGTH_SHORT).show()
-            return
+            Toast.makeText(this, "请输入合法的经纬度数字", Toast.LENGTH_SHORT).show()
+            return false
         }
-        RootConfigBridge.latitude = lat
-        RootConfigBridge.longitude = lon
-        RootConfigBridge.altitude = alt
-        RootConfigBridge.pushToTmpAsync { ok ->
-            if (ok) {
-                statusBanner.text = String.format("已生效 ✅ 当前锚点: %.6f, %.6f", lat, lon)
-                statusBanner.setTextColor(Color.parseColor("#065F46"))
-                statusBanner.background = roundedBg("#D1FAE5", 10)
-                Toast.makeText(this, "坐标已通过 Root 写入共享内存", Toast.LENGTH_SHORT).show()
-            } else {
-                statusBanner.text = "写入失败 ❌ 请确认已授予本应用 Root (su) 权限"
-                statusBanner.setTextColor(Color.parseColor("#991B1B"))
-                statusBanner.background = roundedBg("#FEE2E2", 10)
-            }
+        MockLocationEngine.latitude = lat
+        MockLocationEngine.longitude = lon
+        MockLocationEngine.altitude = alt
+
+        val ok = MockLocationEngine.start(this)
+        if (ok) {
+            statusBanner.text = String.format("免 Root 定位运行中 ✅ 当前坐标: %.5f, %.5f\n提示：共享前建议开启飞行模式再连 Wi-Fi 以防国内基站拉回", lat, lon)
+            statusBanner.setTextColor(Color.parseColor("#065F46"))
+            statusBanner.background = roundedBg("#D1FAE5", 10)
+            Toast.makeText(this, "虚拟定位已注入系统！现在可打开微信共享位置", Toast.LENGTH_SHORT).show()
+        } else {
+            statusBanner.text = "未授权 ❌ 请先点下方第 1 个按钮进入【开发者选项 -> 选择模拟位置信息应用】选中 WeChatLocSpoofer"
+            statusBanner.setTextColor(Color.parseColor("#991B1B"))
+            statusBanner.background = roundedBg("#FEE2E2", 10)
+            Toast.makeText(this, "请先在开发者选项中选择本应用为模拟位置应用", Toast.LENGTH_LONG).show()
         }
+        return ok
     }
 
     private fun toggleFloatingJoystick() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
-            Toast.makeText(this, "请先授予悬浮窗权限以在微信上方显示摇杆", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "请先授予悬浮窗权限", Toast.LENGTH_LONG).show()
             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
             return
         }
-        applyAndSyncCoordinates()
+        if (!startOrUpdateMocking()) return
         val intent = Intent(this, JoystickOverlayService::class.java)
         if (JoystickOverlayService.isRunning) {
             stopService(intent)
             Toast.makeText(this, "已关闭悬浮摇杆", Toast.LENGTH_SHORT).show()
         } else {
             startService(intent)
-            Toast.makeText(this, "已启动悬浮摇杆，可切回微信共享实时位置边走边聊", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "悬浮摇杆已启动！现在切回微信发起实时位置共享即可", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -363,9 +394,7 @@ class MainActivity : Activity() {
         return LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply {
-            topMargin = dp(12)
-        }
+        ).apply { topMargin = dp(12) }
     }
 
     private fun roundedBg(hexColor: String, radiusDp: Int): GradientDrawable {
@@ -378,11 +407,6 @@ class MainActivity : Activity() {
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 }
 
-/**
- * 悬浮窗摇杆服务：
- * 叠加在微信窗口上方，拖动摇杆时根据拉动幅度以 0 ~ 3.5 m/s 的步行/慢跑速度平滑更新经纬度与航向角 (Bearing)，
- * 让朋友在微信“共享实时位置”中看到你的头像正在国外的街道上自然行走。
- */
 class JoystickOverlayService : Service() {
 
     companion object {
@@ -394,7 +418,6 @@ class JoystickOverlayService : Service() {
     private lateinit var coordReadout: TextView
     private val loopHandler = Handler(Looper.getMainLooper())
 
-    // 摇杆归一化向量 (-1.0 .. 1.0) 与最大步行速度 (3.0 m/s)
     @Volatile private var joyVecX = 0f
     @Volatile private var joyVecY = 0f
     private val maxWalkSpeedMetersPerSec = 3.0
@@ -405,27 +428,23 @@ class JoystickOverlayService : Service() {
             val magnitude = hypot(joyVecX.toDouble(), joyVecY.toDouble()).coerceAtMost(1.0)
             if (magnitude > 0.08) {
                 val currentSpeed = (magnitude * maxWalkSpeedMetersPerSec).toFloat()
-                // 屏幕上方为北 (joyVecY < 0 表示向北移动)，屏幕右方为东 (joyVecX > 0 表示向东移动)
-                val moveNorthMeters = -joyVecY * maxWalkSpeedMetersPerSec * 0.5 // 每 500ms 步进一次
+                val moveNorthMeters = -joyVecY * maxWalkSpeedMetersPerSec * 0.5
                 val moveEastMeters = joyVecX * maxWalkSpeedMetersPerSec * 0.5
 
                 val dLat = moveNorthMeters / 111320.0
-                val dLon = moveEastMeters / (111320.0 * cos(Math.toRadians(RootConfigBridge.latitude)).coerceAtLeast(0.0001))
+                val dLon = moveEastMeters / (111320.0 * cos(Math.toRadians(MockLocationEngine.latitude)).coerceAtLeast(0.0001))
 
-                RootConfigBridge.latitude += dLat
-                RootConfigBridge.longitude += dLon
-                RootConfigBridge.speed = currentSpeed
+                MockLocationEngine.latitude += dLat
+                MockLocationEngine.longitude += dLon
+                MockLocationEngine.speed = currentSpeed
 
-                // 计算正北顺时针航向角 (0° - 360°)，使微信实时共享中的箭头方向跟随移动方向旋转
                 var angleDeg = Math.toDegrees(atan2(moveEastMeters, moveNorthMeters)).toFloat()
                 if (angleDeg < 0) angleDeg += 360f
-                RootConfigBridge.bearing = angleDeg
+                MockLocationEngine.bearing = angleDeg
 
-                coordReadout.text = String.format("%.5f, %.5f (%.1fm/s)", RootConfigBridge.latitude, RootConfigBridge.longitude, currentSpeed)
-                RootConfigBridge.pushToTmpAsync()
-            } else if (RootConfigBridge.speed != 0f) {
-                RootConfigBridge.speed = 0f
-                RootConfigBridge.pushToTmpAsync()
+                coordReadout.text = String.format("%.5f, %.5f (%.1fm/s)", MockLocationEngine.latitude, MockLocationEngine.longitude, currentSpeed)
+            } else {
+                MockLocationEngine.speed = 0f
             }
             loopHandler.postDelayed(this, 500)
         }
@@ -460,23 +479,20 @@ class JoystickOverlayService : Service() {
         overlayRoot = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            val bg = GradientDrawable().apply {
+            background = GradientDrawable().apply {
                 setColor(Color.parseColor("#CC111827"))
                 cornerRadius = 28f
             }
-            background = bg
             setPadding(18, 14, 18, 18)
         }
 
-        // 顶部拖拽条与实时坐标简报
         coordReadout = TextView(this).apply {
-            text = String.format("✥ 拖动窗体 | %.4f, %.4f", RootConfigBridge.latitude, RootConfigBridge.longitude)
+            text = String.format("✥ 拖动 | %.4f, %.4f", MockLocationEngine.latitude, MockLocationEngine.longitude)
             textSize = 10f
             setTextColor(Color.WHITE)
             setPadding(6, 2, 6, 8)
         }
 
-        // 支持按住顶部文字栏拖动整个悬浮窗位置
         coordReadout.setOnTouchListener(object : View.OnTouchListener {
             private var startX = 0
             private var startY = 0
@@ -502,7 +518,6 @@ class JoystickOverlayService : Service() {
             }
         })
 
-        // 自定义全向摇杆视图
         val joystickView = JoystickView(this) { nx, ny ->
             joyVecX = nx
             joyVecY = ny
@@ -520,18 +535,12 @@ class JoystickOverlayService : Service() {
         isRunning = false
         loopHandler.removeCallbacksAndMessages(null)
         if (::overlayRoot.isInitialized) {
-            try {
-                windowManager.removeView(overlayRoot)
-            } catch (_: Throwable) {
-            }
+            try { windowManager.removeView(overlayRoot) } catch (_: Throwable) {}
         }
         super.onDestroy()
     }
 }
 
-/**
- * 2D 虚拟摇杆绘制组件
- */
 class JoystickView(
     context: Context,
     private val onVectorChanged: (normX: Float, normY: Float) -> Unit
